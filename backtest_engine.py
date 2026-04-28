@@ -20,6 +20,8 @@ from config import (
     TARGET_CAGR, TARGET_WIN_RATE, MIN_TRADES,
     SELL_PROFIT_TARGET_LO, MAX_POSITION_PCT,
     MIN_HOLD_DAYS_WEAKNESS,
+    MAX_POSITION_ABS, MAX_POSITIONS_HARD_CAP,
+    MIN_GAIN_STRENGTH_EXIT, MAX_HOLD_TRADING_DAYS,
 )
 from indicators import (
     resample_weekly, add_weekly_emas, add_daily_emas,
@@ -116,6 +118,7 @@ class Trade:
     net_pnl:     float = 0.0
     brokerage:   float = 0.0
     is_closed:   bool  = False
+    entry_day_idx: int  = 0        # trading-day counter at entry
 
     def close(self, date, price, reason):
         fill            = price * (1 - SLIPPAGE_PCT)
@@ -240,9 +243,14 @@ class Backtester:
         pos = int(self._sym_dti[sym].searchsorted(date, side="right"))
         return idf.iloc[:pos]
 
-    def _process_exits(self, date, sym, s_hist, i_hist, trade):
+    def _process_exits(self, date, sym, s_hist, i_hist, trade, day_idx=0):
         current = float(s_hist["Close"].iloc[-1])
         wkly    = resample_weekly(s_hist) if len(s_hist) >= 5 else None
+
+        # ── Max hold: force-close after MAX_HOLD_TRADING_DAYS ──────────────
+        if (day_idx - trade.entry_day_idx) >= MAX_HOLD_TRADING_DAYS:
+            trade.close(date, current, "MaxHoldExpiry")
+            return True
 
         new_stop = update_trailing_stop(
             current, trade.entry_price, trade.stop_loss,
@@ -270,7 +278,8 @@ class Backtester:
             return True
 
         swe = sell_when_extended(s_hist)
-        if swe["sell_extended"]:
+        _gain = (current - trade.entry_price) / trade.entry_price
+        if swe["sell_extended"] and _gain >= MIN_GAIN_STRENGTH_EXIT:
             reasons = [k for k, v in swe.items() if v and k != "sell_extended"]
             trade.close(date, current, "+".join(reasons))
             return True
@@ -301,8 +310,11 @@ class Backtester:
         sl       = stop_loss_price(entry_px, "position")
         risk_pct = risk_pct_for_regime(regime)
         shares   = compute_shares(self.portfolio.capital, risk_pct, entry_px, sl)
-        # ── Cap: each position max 10% of current capital ─────────────────
-        max_shares = int(self.portfolio.capital * MAX_POSITION_PCT / entry_px)
+        # ── Cap: 25% of available cash OR Rs 20L absolute max ──────────────
+        max_shares = int(min(
+            self.portfolio.capital * MAX_POSITION_PCT,
+            MAX_POSITION_ABS
+        ) / entry_px)
         shares     = min(shares, max_shares)
         cost       = shares * entry_px
         broker     = brokerage(cost)
@@ -311,6 +323,7 @@ class Backtester:
         t = Trade(sym, "position", date, entry_px, sl, shares,
                   self.portfolio.capital, broker)
         t.initial_stop_loss = sl          # record once; never overwritten
+        # entry_day_idx set by caller (run loop)
         self.portfolio.capital -= (cost + broker)
         return t
 
@@ -328,8 +341,11 @@ class Backtester:
         sl       = stop_loss_price(entry_px, "swing")
         risk_pct = risk_pct_for_regime(regime)
         shares   = compute_shares(self.portfolio.capital, risk_pct, entry_px, sl)
-        # ── Cap: each position max 10% of current capital ─────────────────
-        max_shares = int(self.portfolio.capital * MAX_POSITION_PCT / entry_px)
+        # ── Cap: 25% of available cash OR Rs 20L absolute max ──────────────
+        max_shares = int(min(
+            self.portfolio.capital * MAX_POSITION_PCT,
+            MAX_POSITION_ABS
+        ) / entry_px)
         shares     = min(shares, max_shares)
         cost       = shares * entry_px
         broker     = brokerage(cost)
@@ -338,6 +354,7 @@ class Backtester:
         t = Trade(sym, "swing", date, entry_px, sl, shares,
                   self.portfolio.capital, broker)
         t.initial_stop_loss = sl          # record once; never overwritten
+        # entry_day_idx set by caller (run loop)
         self.portfolio.capital -= (cost + broker)
         return t
 
@@ -417,7 +434,7 @@ class Backtester:
                     still_open.append(trade)
                     continue
                 price_map[sym] = float(s_hist["Close"].iloc[-1])
-                closed = self._process_exits(date, sym, s_hist, i_hist, trade)
+                closed = self._process_exits(date, sym, s_hist, i_hist, trade, loop_idx)
                 if closed:
                     self.portfolio.capital += trade.exit_price * trade.shares
                     self.portfolio.closed_trades.append(trade)
@@ -427,7 +444,12 @@ class Backtester:
 
             # ── Scan entries ──────────────────────────────────────────────
             open_syms = {t.symbol for t in self.portfolio.open_trades}
-            n_slots   = self.max_open - len(self.portfolio.open_trades)
+            # Dynamic max positions:
+            #   - Floor of 10 when capital <= Rs 2 crore (20L cap not yet binding)
+            #   - Scale up to hard-cap of 20 as capital grows past Rs 2 crore
+            _dyn_max  = min(MAX_POSITIONS_HARD_CAP,
+                           max(10, int(self.portfolio.capital / MAX_POSITION_ABS)))
+            n_slots   = _dyn_max - len(self.portfolio.open_trades)
             if n_slots <= 0:
                 self.portfolio.record_equity(date, price_map)
                 continue
@@ -467,6 +489,7 @@ class Backtester:
                 if trade is None and regime != "bear":
                     trade = self._try_swing_entry(date, sym, s_h, i_h, regime)
                 if trade:
+                    trade.entry_day_idx = loop_idx   # stamp for max-hold calc
                     self.portfolio.open_trades.append(trade)
                     price_map[sym] = trade.entry_price
                     added += 1

@@ -484,17 +484,13 @@ def update_trailing_stop(current_price: float, entry: float,
     if gain >= be_trigger and current_stop < entry:
         current_stop = entry
 
-    # Trail below 10-EMA
-    if trade_type == "swing":
-        df = add_daily_emas(stock_df)
-        ema10 = float(df[f"EMA{EMA_10}"].iloc[-1])
-        trail = ema10 * 0.99          # 1% cushion below EMA
-    else:
-        if weekly_df is not None and len(weekly_df) >= 12:
-            wema10 = weekly_df["Close"].ewm(span=10, adjust=False).mean().iloc[-1]
-            trail  = float(wema10) * 0.99
-        else:
-            trail = current_stop
+    # Trail stop with daily 10-EMA for both swing and position trades.
+    # The stop only ever moves UP (ratchet).  Using daily EMA means the
+    # trail responds within a week of a trend change, protecting profits
+    # without being too noisy.
+    df   = add_daily_emas(stock_df)
+    ema10 = float(df[f"EMA{EMA_10}"].iloc[-1])
+    trail = ema10 * 0.99              # 1% cushion below daily 10-EMA
 
     return max(current_stop, trail)
 

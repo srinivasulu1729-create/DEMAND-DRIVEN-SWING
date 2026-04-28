@@ -60,8 +60,8 @@ ADDON_MIN_GAIN_PCT = 0.04             # +4% min before add-on
 ADDON_MAX_SIZE_RATIO = 0.50           # <=50% of original shares
 
 # ── Sell rules ────────────────────────────────────────────────────────────
-SELL_PROFIT_TARGET_LO = 0.30          # +30% -> sell
-SELL_PROFIT_TARGET_HI = 0.35          # +35% -> sell
+SELL_PROFIT_TARGET_LO = 0.18          # 3R target (3x stop) -> sell
+SELL_PROFIT_TARGET_HI = 0.24          # 4R target -> sell
 EMA10W_EXTENSION = 0.55               # >=55% above 10W EMA (rule 27)
 RSI_OVERBOUGHT = 85                   # rule 30
 ACCEL_DAYS = 3                        # consecutive acceleration days (rule 29)
@@ -76,8 +76,12 @@ SWING_BREAKEVEN_TRIGGER = 0.04        # move to BE after +4% (swing)
 
 # ── Position sizing cap ────────────────────────────────────────────────────
 MAX_POSITION_PCT = 0.25               # max 25% of capital per position
+MAX_POSITION_ABS = 2_000_000          # Rs 20 lakh hard cap per position
+MAX_POSITIONS_HARD_CAP = 20           # never more than 20 simultaneous
 
-# ── Hold-period guards ────────────────────────────────────────────────────
+# ── Hold-period guards
+MIN_GAIN_STRENGTH_EXIT = 0.18         # block rule29/30 until +18% (3R)
+MAX_HOLD_TRADING_DAYS = 20            # force-close after 20 trading days
 # Weakness exits (rule31/32/33/34) are blocked for this many calendar days
 # after entry. 5 cal-days ~= 3-4 trading days -- lets the setup develop
 # before a routine EMA re-test kills a perfectly good position.
