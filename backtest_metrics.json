@@ -1,0 +1,22 @@
+{
+  "start_date": "2024-01-01",
+  "end_date": "2024-12-31",
+  "years": 1.0,
+  "starting_capital": 1000000,
+  "ending_capital": 958947.27,
+  "total_trades": 798,
+  "winning_trades": 429,
+  "losing_trades": 369,
+  "cagr_pct": -4.11,
+  "win_rate_pct": 53.76,
+  "avg_win": 3694.71,
+  "avg_loss": -4447.24,
+  "rr_ratio": 0.83,
+  "max_drawdown_pct": -24.81,
+  "profit_factor": 0.98,
+  "sharpe_ratio": -0.03,
+  "pass_cagr": false,
+  "pass_win_rate": false,
+  "pass_trades": true,
+  "OVERALL_PASS": false
+}
