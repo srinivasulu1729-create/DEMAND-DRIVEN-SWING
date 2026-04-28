@@ -251,15 +251,14 @@ class Backtester:
         trade.stop_loss = new_stop
 
         # ── Stop-loss trigger ─────────────────────────────────────────────
-        # Position trades: checked on weekly close (Friday) only.
-        # Swing trades   : checked every daily close.
-        is_friday = pd.Timestamp(date).weekday() == 4
-        check_stop = (trade.trade_type == "swing") or is_friday
-
-        if check_stop and current <= trade.stop_loss:
+        # Checked EVERY day for both position and swing trades.
+        # Position stop was previously Friday-only, but rule31 fires daily and
+        # could catch stocks BELOW the hard stop on non-Friday days, causing
+        # losses exceeding the intended stop width.  Daily check prevents that.
+        if current <= trade.stop_loss:
             # Exit at the stop price, not the (potentially gapped-down) close.
             # This prevents -98% losses from bad-data or gap-down days.
-            exit_px = max(trade.stop_loss, current)   # stop or worse
+            exit_px = max(trade.stop_loss, current)
             trade.close(date, exit_px, "StopLoss")
             return True
 
@@ -286,7 +285,10 @@ class Backtester:
             sow = sell_on_weakness(s_hist, _i_hist)
             if sow["sell_weakness"]:
                 reasons = [k for k, v in sow.items() if v and k != "sell_weakness"]
-                trade.close(date, current, "+".join(reasons))
+                # Cap weakness exit at the hard stop level — rule31 must never
+                # exit at a price worse than what the stop-loss would give.
+                exit_px = max(trade.stop_loss, current)
+                trade.close(date, exit_px, "+".join(reasons))
                 return True
 
         return False
@@ -816,12 +818,4 @@ class BacktestResult:
                 vc.alignment = sc.alignment = center_al
                 if status == "PASS":
                     sc.fill = pass_fill
-                    sc.font = Font(name="Arial", bold=True, size=10, color="375623")
-                elif status == "FAIL":
-                    sc.fill = fail_fill
-                    sc.font = Font(name="Arial", bold=True, size=10, color="9C0006")
-                if label == "OVERALL":
-                    lc.fill = vc.fill = pass_fill if m["OVERALL_PASS"] else fail_fill
-                    lc.font = vc.font = Font(name="Arial", bold=True, size=11)
-
-        wb.save(path)
+         

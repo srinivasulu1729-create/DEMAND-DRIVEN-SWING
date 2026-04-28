@@ -43,7 +43,7 @@ VOL_AVG_PERIOD = 20                   # volume 20-day avg
 POSITION_LOOKBACK_DAYS = 40           # ~6-8 weeks in trading days
 WEEKLY_GREEN_WINDOW = 8               # last N weekly candles
 WEEKLY_GREEN_MIN = 6                  # at least 6 must be green
-RS_MIN_RATIO = 3.0                    # RS >= 3x index
+RS_MIN_RATIO = 4.0                    # RS >= 4x index
 
 # ── Entry rules ───────────────────────────────────────────────────────────
 BREAKOUT_WEEKS = 8                    # new 8-week high for breakout
@@ -71,11 +71,11 @@ HEAVY_RED_CONSEC = 2                  # 2+ consecutive (rule 34)
 # ── Stop-loss ─────────────────────────────────────────────────────────────
 POSITION_SL_PCT = 0.06                # 6% below entry (position, weekly close basis)
 SWING_SL_PCT = 0.035                  # 3.5% below entry (swing, daily close basis)
-POSITION_BREAKEVEN_TRIGGER = 0.06     # move to BE after +6% (position)
+POSITION_BREAKEVEN_TRIGGER = 0.03     # move to BE after +3% (position)
 SWING_BREAKEVEN_TRIGGER = 0.04        # move to BE after +4% (swing)
 
 # ── Position sizing cap ────────────────────────────────────────────────────
-MAX_POSITION_PCT = 0.20               # max 20% of capital per position
+MAX_POSITION_PCT = 0.25               # max 25% of capital per position
 
 # ── Hold-period guards ────────────────────────────────────────────────────
 # Weakness exits (rule31/32/33/34) are blocked for this many calendar days
