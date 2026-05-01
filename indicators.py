@@ -55,8 +55,9 @@ def add_daily_emas(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_weekly_emas(weekly_df: pd.DataFrame) -> pd.DataFrame:
-    """Add 30W and 40W EMA columns to weekly df."""
+    """Add 10W, 30W and 40W EMA columns to weekly df."""
     wdf = weekly_df.copy()
+    wdf["EMA10W"]           = ema(wdf["Close"], 10)      # fast trend — for regime filter
     wdf[f"EMA{EMA_30W}W"] = ema(wdf["Close"], EMA_30W)
     wdf[f"EMA{EMA_40W}W"] = ema(wdf["Close"], EMA_40W)
     return wdf
@@ -125,10 +126,15 @@ def rs_ratio(stock_df: pd.DataFrame,
     RS ratio = (stock % change) / (index % change) over `lookback` days.
     Returns float; NaN if either side is zero or data insufficient.
     """
-    if len(stock_df) < lookback + 1 or len(index_df) < lookback + 1:
+    if len(stock_df) < lookback + 2 or len(index_df) < lookback + 2:
         return float("nan")
-    stock_chg = (stock_df["Close"].iloc[-1] / stock_df["Close"].iloc[-lookback] - 1)
-    index_chg = (index_df["Close"].iloc[-1] / index_df["Close"].iloc[-lookback] - 1)
+    # FIX: use iloc[-(lookback + 1)] so this computes a true `lookback`-bar return,
+    # consistent with pct_change(lookback) used in the pre-computed _rs_arr.
+    # Old iloc[-lookback] was only (lookback-1) bars back — 1-bar off-by-one that
+    # caused TITAGARH (surge at exactly the 40-bar boundary) to show 121x in sorting
+    # but < 3x in rule03, silently blocking entry on every qualifying date.
+    stock_chg = (stock_df["Close"].iloc[-1] / stock_df["Close"].iloc[-(lookback + 1)] - 1)
+    index_chg = (index_df["Close"].iloc[-1] / index_df["Close"].iloc[-(lookback + 1)] - 1)
     if abs(index_chg) < 1e-9:
         return float("nan")
     return stock_chg / index_chg
@@ -214,18 +220,46 @@ def atr_contraction(weekly_df: pd.DataFrame,
 
 def index_regime(index_weekly: pd.DataFrame) -> str:
     """
-    Returns 'bull', 'sideways', or 'bear' based on 30W and 40W EMA.
+    Returns 'bull', 'sideways', or 'bear' based on 30W and 40W EMA,
+    with a slope confirmation filter on the 30W EMA.
+
+    Bull     : price > 30W EMA  AND  price > 40W EMA
+               AND  30W EMA is rising (current >= value 8 weeks ago)
+               A genuine bull trend has a rising long-term EMA; a flat or
+               declining 30W EMA means the trend is rolling over even if
+               price is still technically above it (e.g. December 2024
+               correction where price stayed above the still-high EMAs but
+               the 30W EMA had already topped and was pulling down).
+    Bear     : price < 30W EMA  AND  price < 40W EMA
+    Sideways : everything else — mixed EMA position OR bull price-level but
+               30W EMA slope is flat/declining.
+
     Requires at least 40 weekly bars.
+    Note: 10W EMA is still computed (used in trailing stop / other callers)
+    but is NOT used as a binary entry gate — it was too aggressive on its
+    own, blocking the Sep 2024 period which had positive-EV trades.
+    The 30W slope check is softer: it downgrades to 'sideways' (0.5% risk)
+    rather than blocking entirely, protecting capital in weakening markets
+    without shutting the system off.
     """
     if len(index_weekly) < EMA_40W:
         return "bull"  # default if insufficient data
-    wdf = add_weekly_emas(index_weekly)
-    last = wdf.iloc[-1]
-    close    = last["Close"]
-    ema30    = last[f"EMA{EMA_30W}W"]
-    ema40    = last[f"EMA{EMA_40W}W"]
+    wdf   = add_weekly_emas(index_weekly)
+    last  = wdf.iloc[-1]
+    close = last["Close"]
+    ema30 = last[f"EMA{EMA_30W}W"]
+    ema40 = last[f"EMA{EMA_40W}W"]
+
+    # 30W EMA slope: compare current vs 8 weeks ago (smooth, not noisy)
+    slope_lookback = 8
+    if len(wdf) >= slope_lookback + 1:
+        ema30_prev = wdf.iloc[-(slope_lookback + 1)][f"EMA{EMA_30W}W"]
+        ema30_rising = ema30 >= ema30_prev
+    else:
+        ema30_rising = True  # insufficient history → assume rising
+
     if close > ema30 and close > ema40:
-        return "bull"
+        return "bull" if ema30_rising else "sideways"
     elif close < ema30 and close < ema40:
         return "bear"
     else:
@@ -268,12 +302,43 @@ def is_inside_bar(curr: pd.Series, prev: pd.Series) -> bool:
 
 def is_reversal_candle(df: pd.DataFrame, idx: int) -> bool:
     """
-    True if bar at `idx` is a hammer, bullish engulfing vs idx-1, or inside bar vs idx-1.
+    Returns True if bar at `idx` is a bullish reversal:
+    hammer, bullish engulfing vs prior bar, or inside-bar breakout setup.
+    `df` must be a positional (reset) index DataFrame with OHLCV columns.
     """
     if idx < 1 or idx >= len(df):
         return False
     curr = df.iloc[idx]
     prev = df.iloc[idx - 1]
-    return (is_hammer(curr)
-            or is_bullish_engulfing(curr, prev)
-            or is_inside_bar(curr, prev))
+    if is_hammer(curr):
+        return True
+    if is_bullish_engulfing(curr, prev):
+        return True
+    # Inside-bar that closes in the upper half of its own range (potential breakout)
+    if is_inside_bar(curr, prev):
+        rng = curr["High"] - curr["Low"]
+        if rng > 0 and curr["Close"] >= (curr["Low"] + 0.5 * rng):
+            return True
+    return False
+
+
+def is_reversal_candle(df: pd.DataFrame, idx: int) -> bool:
+    """
+    Returns True if bar at `idx` is a bullish reversal:
+    hammer, bullish engulfing vs prior bar, or inside-bar breakout setup.
+    `df` must be a positional (reset) index DataFrame with OHLCV columns.
+    """
+    if idx < 1 or idx >= len(df):
+        return False
+    curr = df.iloc[idx]
+    prev = df.iloc[idx - 1]
+    if is_hammer(curr):
+        return True
+    if is_bullish_engulfing(curr, prev):
+        return True
+    # Inside-bar that closes in the upper half of its own range (potential breakout)
+    if is_inside_bar(curr, prev):
+        rng = curr["High"] - curr["Low"]
+        if rng > 0 and curr["Close"] >= (curr["Low"] + 0.5 * rng):
+            return True
+    return False

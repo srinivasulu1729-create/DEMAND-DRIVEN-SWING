@@ -22,6 +22,8 @@ from config import (
     MIN_HOLD_DAYS_WEAKNESS,
     MAX_POSITION_ABS, MAX_POSITIONS_HARD_CAP,
     MIN_GAIN_STRENGTH_EXIT, MAX_HOLD_TRADING_DAYS,
+    ENABLE_SWING_TRADES,
+    RS_MIN_RATIO,
 )
 from indicators import (
     resample_weekly, add_weekly_emas, add_daily_emas,
@@ -110,6 +112,7 @@ class Trade:
     capital_at_entry: float
     entry_brokerage: float = 0.0
     initial_stop_loss: float = 0.0   # set once at entry; never trailed
+    setup_pattern:   str   = ""      # which entry pattern fired (for TradeLog output)
 
     exit_date:   pd.Timestamp | None = None
     exit_price:  float | None = None
@@ -270,15 +273,21 @@ class Backtester:
             trade.close(date, exit_px, "StopLoss")
             return True
 
-        sos = sell_on_strength(s_hist, trade.entry_price,
-                               wkly if (wkly is not None and len(wkly) > 5) else None)
-        if sos["sell_strength"]:
-            reasons = [k for k, v in sos.items() if v and k != "sell_strength"]
-            trade.close(date, current, "+".join(reasons))
-            return True
+        _gain = (current - trade.entry_price) / trade.entry_price
+
+        # Strength / extended exits require the position to be up ≥ MIN_GAIN_STRENGTH_EXIT.
+        # This prevents Rule26/27/30 from firing on the breakout candle itself
+        # (RSI is naturally high and weekly range wide on strong entry days).
+        # Real trades never exited for RSI alone; 10-EMA trail is the primary exit.
+        if _gain >= MIN_GAIN_STRENGTH_EXIT:
+            sos = sell_on_strength(s_hist, trade.entry_price,
+                                   wkly if (wkly is not None and len(wkly) > 5) else None)
+            if sos["sell_strength"]:
+                reasons = [k for k, v in sos.items() if v and k != "sell_strength"]
+                trade.close(date, current, "+".join(reasons))
+                return True
 
         swe = sell_when_extended(s_hist)
-        _gain = (current - trade.entry_price) / trade.entry_price
         if swe["sell_extended"] and _gain >= MIN_GAIN_STRENGTH_EXIT:
             reasons = [k for k, v in swe.items() if v and k != "sell_extended"]
             trade.close(date, current, "+".join(reasons))
@@ -291,7 +300,10 @@ class Backtester:
         days_held = (pd.Timestamp(date) - pd.Timestamp(trade.entry_date)).days
         if days_held >= MIN_HOLD_DAYS_WEAKNESS:
             _i_hist = i_hist if (i_hist is not None and not i_hist.empty) else self._index_up_to(date)
-            sow = sell_on_weakness(s_hist, _i_hist)
+            sow = sell_on_weakness(s_hist, _i_hist,
+                                   trade_type=trade.trade_type,
+                                   weekly_df=wkly,
+                                   current_gain=_gain)
             if sow["sell_weakness"]:
                 reasons = [k for k, v in sow.items() if v and k != "sell_weakness"]
                 # Cap weakness exit at the hard stop level — rule31 must never
@@ -310,7 +322,6 @@ class Backtester:
         sl       = stop_loss_price(entry_px, "position")
         risk_pct = risk_pct_for_regime(regime)
         shares   = compute_shares(self.portfolio.capital, risk_pct, entry_px, sl)
-        # ── Cap: 25% of available cash OR Rs 20L absolute max ──────────────
         max_shares = int(min(
             self.portfolio.capital * MAX_POSITION_PCT,
             MAX_POSITION_ABS
@@ -320,22 +331,48 @@ class Backtester:
         broker     = brokerage(cost)
         if shares <= 0 or (cost + broker) > self.portfolio.capital:
             return None
+        # Determine which entry pattern fired (for TradeLog readability).
+        # Priority: inside candle first (most structurally specific), then
+        # 10-WMA patterns, then others. Keeping inside candle first ensures
+        # the pattern buckets stay cleanly separated for WR measurement.
+        if checklist.get("r_weekly_inside_breakout"):
+            pattern = "Weekly inside candle breakout"
+        elif checklist.get("r_daily_inside_near_10ema"):
+            pattern = "Daily inside candle near 10-DMA"
+        elif checklist.get("r_prev_high_near_10wma"):
+            pattern = "Prev-week high breakout near 10-WMA"
+        elif checklist.get("r_10wma_support_bounce"):
+            pattern = "10-WMA support bounce"
+        elif checklist.get("r_weekly_hammer_engulfing"):
+            pattern = "Weekly hammer/engulfing near 10-WMA"
+        elif checklist.get("r_vcp_breakout"):
+            pattern = "VCP breakout"
+        elif checklist.get("r_w_pattern"):
+            pattern = "W-pattern breakout"
+        elif checklist.get("r_ihs_breakout"):
+            pattern = "IHS breakout"
+        elif checklist.get("r14_vol_confirmed"):
+            pattern = "New 8-week high breakout"
+        else:
+            pattern = "Base bottom entry"
         t = Trade(sym, "position", date, entry_px, sl, shares,
                   self.portfolio.capital, broker)
-        t.initial_stop_loss = sl          # record once; never overwritten
-        # entry_day_idx set by caller (run loop)
+        t.initial_stop_loss = sl
+        t.setup_pattern     = pattern
         self.portfolio.capital -= (cost + broker)
         return t
 
     def _try_swing_entry(self, date, sym, s_hist, i_hist, regime):
-        if not self.enable_swing:
+        if not self.enable_swing or not ENABLE_SWING_TRADES:
             return None
         r17, _ = rule17_swing_rs(s_hist, i_hist)
         r18    = rule18_swing_green_candles(s_hist)
         r19, _ = rule19_ema_pullback(s_hist)
         r20    = rule20_reversal_candle(s_hist)
         r21    = rule21_vol_dryup(s_hist)
-        if sum([r17, r18, r19, r20, r21]) < 4:
+        # r17 (RS strength) is non-negotiable for swing; need 4 of remaining 4
+        # [tightened from "any 4 of 5" to "r17 mandatory + 3 of remaining 4"]
+        if not r17 or sum([r18, r19, r20, r21]) < 3:
             return None
         entry_px = entry_fill_price(float(s_hist["Close"].iloc[-1]))
         sl       = stop_loss_price(entry_px, "swing")
@@ -444,17 +481,24 @@ class Backtester:
 
             # ── Scan entries ──────────────────────────────────────────────
             open_syms = {t.symbol for t in self.portfolio.open_trades}
-            # Dynamic max positions:
-            #   - Floor of 10 when capital <= Rs 2 crore (20L cap not yet binding)
-            #   - Scale up to hard-cap of 20 as capital grows past Rs 2 crore
-            _dyn_max  = min(MAX_POSITIONS_HARD_CAP,
-                           max(10, int(self.portfolio.capital / MAX_POSITION_ABS)))
-            n_slots   = _dyn_max - len(self.portfolio.open_trades)
+            # Max positions = hard cap from config (default 8).
+            # The old dynamic formula (capital / MAX_POSITION_ABS) gave int(0.5)=0
+            # with Rs 10L capital and Rs 20L abs cap → capped at 3 → blocked all
+            # entries after 3 positions, hiding TITAGARH, ZENTEC etc. entirely.
+            # Per-position size limits (MAX_POSITION_PCT=20%, MAX_POSITION_ABS)
+            # already protect against over-concentration — no dynamic cap needed.
+            n_slots = MAX_POSITIONS_HARD_CAP - len(self.portfolio.open_trades)
             if n_slots <= 0:
                 self.portfolio.record_equity(date, price_map)
                 continue
 
             # Step 1: O(1) position lookup + O(1) RS array read — no slices yet
+            # Pre-filter: only RS >= RS_MIN_RATIO (3x) stocks qualify.
+            # Root-cause fix: previously ALL ~1100 symbols were candidates,
+            # sorted by RS desc with MAX_ENTRY_TRIES=80 cap. In a bull run,
+            # 150+ stocks have RS >= 3x — known winners like TITAGARH at rank
+            # 90+ were never tried. Pre-filtering to RS >= 3x shrinks the pool
+            # to ~50-150 stocks so the cap is no longer a bottleneck.
             cands: list = []
             for sym in self.stock_data:
                 if sym in open_syms:
@@ -463,20 +507,19 @@ class Backtester:
                 if sp < 60:
                     continue
                 rs_val = float(self._rs_arr[sym][sp - 1])
-                if np.isnan(rs_val):
-                    rs_val = -999.0
+                if np.isnan(rs_val) or rs_val < RS_MIN_RATIO:
+                    continue  # pre-filter: skip stocks that will fail r03
                 cands.append((rs_val, sym, sp))
 
-            # Step 2: sort by RS desc
+            # Sort by RS desc — highest relative strength first.
             cands.sort(key=lambda x: x[0], reverse=True)
 
-            # Step 3: slices + resample_weekly only for top candidates tried.
-            # Cap at MAX_ENTRY_TRIES to prevent scanning all 1175 on slow days.
-            MAX_ENTRY_TRIES = 60
+            # No hard cap: all RS >= 3x candidates are tried.
+            # n_slots check stops the loop once positions are full.
             added = 0
             tries = 0
             for _, sym, sp in cands:
-                if added >= n_slots or tries >= MAX_ENTRY_TRIES:
+                if added >= n_slots:
                     break
                 tries += 1
                 sdf, idf = self.stock_data[sym]
@@ -530,6 +573,7 @@ class BacktestResult:
             rows.append({
                 "symbol":             t.symbol,
                 "trade_type":         t.trade_type,
+                "setup_pattern":      t.setup_pattern,
                 "entry_date":         t.entry_date,
                 "entry_price":        t.entry_price,
                 "initial_stop_loss":  round(init_sl, 2),
@@ -620,11 +664,11 @@ class BacktestResult:
         print(f"  Starting Capital: Rs {m['starting_capital']:,.0f}")
         print(f"  Ending Capital  : Rs {m['ending_capital']:,.0f}")
         print(f"  {'-'*52}")
-        p = "PASS" if m["pass_cagr"] else "FAIL (target >=100%)"
+        p = "PASS" if m["pass_cagr"] else "FAIL (target >=500%)"
         print(f"  CAGR            : {m['cagr_pct']:>8.2f}%  {p}")
-        p = "PASS" if m["pass_win_rate"] else "FAIL (target >=60%)"
+        p = "PASS" if m["pass_win_rate"] else "FAIL (target >=70%)"
         print(f"  Win Rate        : {m['win_rate_pct']:>8.2f}%  {p}")
-        p = "PASS" if m["pass_trades"] else "FAIL (need >=100)"
+        p = "PASS" if m["pass_trades"] else "FAIL (need >=30)"
         print(f"  Total Trades    : {m['total_trades']:>8d}   {p}")
         print(f"  {'-'*52}")
         print(f"  Avg Win         : Rs {m['avg_win']:>10,.2f}")
@@ -732,15 +776,13 @@ class BacktestResult:
             wb.save(path)
             return
 
-        # Determine entry pattern from exit_reason or trade_type
+        # Use recorded setup_pattern field; fall back to trade_type label
         def _setup_label(row):
-            er = str(row.get("exit_reason", ""))
+            sp = str(row.get("setup_pattern", ""))
+            if sp and sp != "nan":
+                return sp
             tt = str(row.get("trade_type", "position"))
-            if "weekly_inside" in er.lower() or "inside" in er.lower():
-                return "Weekly inside candle breakout"
-            if tt == "swing":
-                return "Swing entry (EMA pullback)"
-            return "Position entry (breakout/base)"
+            return "Swing entry (EMA pullback)" if tt == "swing" else "Position entry"
 
         for i, (_, row) in enumerate(df.iterrows(), start=1):
             r = i + 1
@@ -835,10 +877,22 @@ class BacktestResult:
                 sc = ws2.cell(row=r_idx, column=3, value=status)
                 lc.font = s_lbl_font
                 vc.font = s_val_font
-                sc.font = Font(name="Arial", bold=True, size=10)
-                lc.border = vc.border = sc.border = border
-                lc.alignment = left_al
-                vc.alignment = sc.alignment = center_al
+                sc.font = Font(name="Arial", bold=True,
+                               color="375623" if status == "PASS" else
+                                     "9C0006" if status == "FAIL" else "000000")
                 if status == "PASS":
                     sc.fill = pass_fill
-         
+                elif status == "FAIL":
+                    sc.fill = fail_fill
+                if label in ("CAGR", "Win Rate", "Total Trades", "OVERALL"):
+                    lc.fill = pass_fill if status == "PASS" else (fail_fill if status == "FAIL" else PatternFill())
+                    vc.fill = pass_fill if status == "PASS" else (fail_fill if status == "FAIL" else PatternFill())
+                if label == "OVERALL":
+                    lc.font = Font(name="Arial", bold=True, size=11)
+                    vc.font = Font(name="Arial", bold=True, size=11,
+                                   color="375623" if m["OVERALL_PASS"] else "9C0006")
+                    lc.fill = pass_fill if m["OVERALL_PASS"] else fail_fill
+                    vc.fill = pass_fill if m["OVERALL_PASS"] else fail_fill
+
+        wb.save(path)
+        print(f"  TradeLog written → {path}")

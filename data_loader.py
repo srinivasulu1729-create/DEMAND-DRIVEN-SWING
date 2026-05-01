@@ -59,7 +59,12 @@ def _query_stock(symbol: str) -> pd.DataFrame | None:
         if raw.empty:
             return None
         df = pd.DataFrame()
-        df["date"] = pd.to_datetime(raw["Date"], format="%d-%b-%Y", errors="coerce")
+        # FIX: do NOT pass format= — old parquet years (2010-2021) may store
+        # dates in a different format (e.g. "2010-01-03" vs "03-Jan-2023").
+        # Strict format="%d-%b-%Y" silently converts mismatches to NaT which
+        # then get dropped, causing stocks to appear as if they have no history
+        # before ~2022 even when full data exists on disk.
+        df["date"] = pd.to_datetime(raw["Date"], errors="coerce")
         # Price columns: handle both DOUBLE (some years) and VARCHAR-with-commas (other years)
         for raw_col, alias in [
             ("Open Price",  "Open"),
@@ -112,11 +117,61 @@ def load_index() -> pd.DataFrame:
     return df
 
 
+
+def _detect_and_truncate_splits(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """
+    Detect stock splits / bonus issues from single-day price discontinuities.
+
+    Raw NSE EOD data is unadjusted — a 2:1 split shows as a ~50% overnight
+    price drop on ex-date.  Any close-to-close ratio below 0.55 (catches
+    splits 2:1, 3:1, 4:1, bonus 1:1) or above 1.80 (reverse splits) is
+    treated as a corporate action.  Data BEFORE the last such event is
+    discarded so that EMA, RS, and base calculations all use a single
+    price scale consistent with current market prices.
+
+    Threshold rationale:
+      - Legitimate single-day crashes rarely exceed -45% in NSE mid/small caps.
+      - 2:1 split  → ratio ~0.50  (caught by < 0.55)
+      - 3:1 split  → ratio ~0.33  (caught)
+      - 1:1 bonus  → ratio ~0.50  (caught)
+      - Reverse split 1:2 → ratio ~2.0  (caught by > 1.80)
+    """
+    if len(df) < 2:
+        return df
+
+    close    = df["Close"].values
+    prev_cls = df["Close"].shift(1).values
+    with __import__("warnings").catch_warnings():
+        __import__("warnings").simplefilter("ignore")
+        ratio = close / prev_cls          # NaN for first row — ignored below
+
+    # Find indices where ratio signals a corporate action
+    import numpy as _np
+    split_mask = (_np.array(ratio) < 0.55) | (_np.array(ratio) > 1.80)
+    split_mask[0] = False                 # first row always NaN ratio — skip
+    split_indices = _np.where(split_mask)[0]
+
+    if len(split_indices) == 0:
+        return df
+
+    # Keep only data from the last split date onward
+    last_idx = int(split_indices[-1])
+    df_clean = df.iloc[last_idx:].reset_index(drop=True)
+    logger.debug(
+        "[SPLIT] %s: %d corporate action(s) detected; keeping data from %s "
+        "(%d rows, discarded %d pre-event rows)",
+        symbol, len(split_indices),
+        df_clean["date"].iloc[0].date(), len(df_clean), last_idx
+    )
+    return df_clean
+
+
 def load_stock(symbol: str) -> pd.DataFrame | None:
     df = _query_stock(symbol)
     if df is None:
         return None
     df = _validate(df, symbol)
+    df = _detect_and_truncate_splits(df, symbol)  # remove pre-split history
     if not _universe_ok(df, symbol):
         return None
     return df
